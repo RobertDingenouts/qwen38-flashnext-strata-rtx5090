@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# udab — A/B-matrix Unsloth Dynamic: iq3s (huidig) vs udq4 (IQ4_XS) vs udq3 (IQ3_XXS).
+# JIJ draait dit in een terminal op kiebel:  ~/bin/udab
+# Veilig: RAM-guard vooraf, keeper op pauze tijdens de run, EXIT-trap zet keeper terug aan.
+# NB: tijdens de run valt de 8890-endpoint elke paar minuten weg (stbench start per model
+#     een eigen engine) — Hermes/Telegram-lokaal is dan even onbereikbaar. Duurt ~60-90 min.
+set -u
+OUT=~/bin/udab-out/$(date +%Y%m%d-%H%M%S)
+mkdir -p "$OUT"
+KEEPER_WAS_ON=0
+if [ ! -f "$HOME/.ai-keeper-paused" ]; then KEEPER_WAS_ON=1; fi
+restore() {
+  (( KEEPER_WAS_ON )) && bash -ic 'keeper on' >/dev/null 2>&1
+  echo "[$(date +%T)] keeper-terugzet ($((KEEPER_WAS_ON)))."
+}
+trap restore EXIT
+echo "[$(date +%T)] udab start — keeper op pauze, 8890 schoongemaakt. Rapport: $OUT"
+bash -ic 'keeper off' >/dev/null 2>&1
+pkill -f '[s]erve/server\.py' 2>/dev/null || true
+pkill -f '[e]ngine/strata --serve' 2>/dev/null || true
+pkill -x '[s]trata-host' 2>/dev/null || true
+# 50GB+ engines laten loslaten duurt incl. swap-drain op deze kernel 3-6 MINUUT:
+# dus maximaal 10 min wachten, met teller. Tijdens de wacht keeper op pauze -> geen herstart.
+for i in $(seq 1 120); do
+  avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)   # MB
+  (( avail >= 3000 )) && break
+  (( i % 6 == 0 )) && echo "   ...wachten op RAM-vrijgave: ${avail}MB vrij (ronde $i/120)"
+  sleep 5
+done
+if (( avail < 3000 )); then
+  echo "❌ RAM-available ${avail}MB ook na 10 min nog < 3GB — udab stopt (niets gemeten)."
+  echo "   Draaiende geheugenvreters:"; ps aux --sort=-rss | awk 'NR<=6{printf "   %6.1fGB %s\n",$6/1048576,substr($0,index($0,$11),80)}'
+  exit 1
+fi
+echo "[$(date +%T)] RAM ok: $((avail/1024))GB beschikbaar — matrix start."
+declare -A DIRS
+for M in iq3s udq4 udq3; do
+  printf '\n═══ %s  %s ═══\n' "$M" "$(date +%T)"
+  ~/bin/stbench "$M" 2>&1 | tee "$OUT/$M.console"
+  d=$(ls -td "$HOME"/bin/stbench-out/*/ | head -1)
+  DIRS[$M]=$d
+  [ -f "$d/report.md" ] && cp "$d/report.md" "$OUT/$M.md"
+  echo "→ $d"
+done
+{
+  echo "# A/B Unsloth Dynamic — $(date)"
+  echo
+  for M in iq3s udq4 udq3; do
+    echo "## $M  (${DIRS[$M]})"
+    if [ -f "$OUT/$M.md" ]; then
+      sed -n '/^## Mediaan/,/^```$/p' "$OUT/$M.md" | sed -n '1,12p'
+      grep -m1 "drafts accepted\|MTP" "$OUT/$M.console" 2>/dev/null
+    else
+      echo "(geen rapport — zie $OUT/$M.console)"
+    fi
+    echo
+  done
+} > "$OUT/SAMENVATTING.md"
+echo
+cat "$OUT/SAMENVATTING.md"
+echo "[$(date +%T)] udab klaar — alles staat in $OUT"

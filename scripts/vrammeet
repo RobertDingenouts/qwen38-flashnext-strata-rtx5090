@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# VRAM-meetpas: TTS -> samen -> moss_turbo -> YuE2 naast strata lite.
+# Trapt NOOIT tegen strata/8890; raakt geen GPU-servers van buitenaf.
+set -u
+OUT=~/bin/vrammeet-out/$(date +%Y%m%d-%H%M%S); mkdir -p ~/bin/vrammeet-out; mkdir -p "$OUT"
+USED="$OUT/used.csv"; PH="$OUT/phases.log"
+TOKEN=$(cat ~/beeld-studio/apps/beeldstudio/token.txt)
+YUE2_PROJ=20261104-232027-vramtest2
+
+say(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
+phase(){ echo "$(date +%s) $1" >> "$PH"; say "FASE $1"; }
+
+# sampler
+( while :; do echo "$(date +%s),$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)" >> "$USED"; sleep 2; done ) &
+SAMP=$!
+trap 'kill $SAMP 2>/dev/null' EXIT
+
+waitjob(){ # $1=label $2=poll-curl $3=jq-status-filter $4=maxsec
+  local t0=$(date +%s) st=""
+  while [ $(( $(date +%s) - t0 )) -lt "$4" ]; do
+    st=$(eval "$2" 2>/dev/null | jq -r "$3" 2>/dev/null | head -1)
+    case "$st" in done|klaar|finished|error|fout|failed|cancelled|null|"") :;; *) sleep 8; continue;; esac
+    [ "$st" != "" ] && [ "$st" != "null" ] && break
+    sleep 8
+  done
+  say "$1: eind-status=$st na $(( $(date +%s) - t0 ))s"
+}
+
+phase idle-basis; sleep 15
+
+# 1) TTS audio8
+phase tts
+VO=$(curl -s -m5 http://127.0.0.1:8898/api/voices | jq -r '.[0].name // empty')
+TID=$(curl -s -m10 -X POST http://127.0.0.1:8898/api/jobs -H 'Content-Type: application/json' \
+  -d "{\"text\":\"Hallo Robert, dit is een gecontroleerde VRAM-meting naast het chatmodel.\",\"voice\":\"$VO\"}" | jq -r '.id // empty')
+say "tts job=$TID voice=$VO"
+[ -n "$TID" ] && waitjob tts "curl -s -m5 http://127.0.0.1:8898/api/state" \
+  '(.jobs//.)[]|select((.id|tostring)=="'"$TID"'")|.status' 300
+phase idle-tussen; sleep 20
+
+# 2) Beeld samen
+phase samen
+SID=$(curl -s -m10 -X POST "http://127.0.0.1:8090/api/generate?k=$TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"samen","prompt":"a blue square on yellow background, flat, simple"}' | jq -r '.id // .job // empty')
+say "beeld samen job=$SID"
+[ -n "$SID" ] && waitjob samen "curl -s -m5 'http://127.0.0.1:8090/api/job/$SID?k=$TOKEN'" '.status // .state // empty' 420
+
+# 3) moss_turbo direct daarna (warme comfy -> nieuwe gate-skip)
+sleep 5
+phase moss_turbo
+MID=$(curl -s -m10 -X POST "http://127.0.0.1:8090/api/generate?k=$TOKEN" -H 'Content-Type: application/json' \
+  -d '{"model":"moss_turbo","prompt":"a lighthouse by the sea at dusk, painterly"}' | jq -r '.id // .job // empty')
+say "beeld moss_turbo job=$MID"
+[ -n "$MID" ] && waitjob moss "curl -s -m5 'http://127.0.0.1:8090/api/job/$MID?k=$TOKEN'" '.status // .state // empty' 480
+
+phase idle-tussen2; sleep 20
+
+# 4) YuE2
+phase yue2
+YT0=$(date +%s)
+curl -s -m10 -X POST http://127.0.0.1:8899/api/generate -H 'Content-Type: application/json' \
+  -d "{\"project\":\"$YUE2_PROJ\",\"style\":\"pop, minimal, 80 bpm\",\"lyrics\":\"\",\"tag\":\"take-vrammeting\"}" -o "$OUT/yue2post.json"
+say "yue2 post: $(head -c 120 "$OUT/yue2post.json")"
+waitjob yue2 "curl -s -m5 http://127.0.0.1:8899/api/state" \
+  '(.jobs//.)[]|select((.started//0) > '"$YT0"')|.status' 360
+
+phase einde; sleep 6
+kill $SAMP 2>/dev/null
+
+# per-fase piek
+say '— PERIADE PIEK —'
+awk -F, -v ph="$PH" 'BEGIN{while((getline l < ph)>0){split(l,a," ");ts[++n]=a[1];nm[n]=a[2]}}
+  {t=$1;u=$2+0;cur="";for(i=1;i<=n;i++)if(t>=ts[i])cur=nm[i];
+   if(cur!=""){if(!(cur in mx)||u>mx[cur])mx[cur]=u;if(!(cur in mn))mn[cur]=u}}
+  END{base=mn["idle-basis"];for(i=1;i<=n;i++){c=nm[i];if(c in mx)printf "%-13s piek %6d MiB | Δ %+6d MiB | vrij op piek %6d MiB\n",c,mx[c],mx[c]-base,32607-mx[c]}}' "$USED" > "$OUT/pieken.txt"
+cat "$OUT/pieken.txt" | tee -a "$OUT/run.log"
+say "KLAAR — $OUT"

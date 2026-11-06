@@ -1,0 +1,53 @@
+{
+  "exe": "/home/suffie/strata/engine/strata",
+  "args": [
+    "--pack",
+    "/home/suffie/Strata-data/packs/ud-iq3_xxs",
+    "--native",
+    "/home/suffie/Strata-data/models/qwen38-flashnext-unsloth/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf",
+    "--expert-profile",
+    "/home/suffie/strata/data/expert-profile.bin",
+    "--expert-cache",
+    "auto",
+    "--prefill",
+    "auto",
+    "--mmap-experts",
+    "--kv-resident",
+    "32768",
+    "--max-context",
+    "262144",
+    "--kv",
+    "int8",
+    "--vision",
+    "--vram-reserve-mib",
+    "700"
+  ],
+  "env": {
+    "STRATA_HC_Q8": "1",
+    "STRATA_ROUTE_TAIL_SKIP": "0"
+  },
+  "cwd": "/home/suffie/strata",
+  "tokenizer": "/home/suffie/Strata-data/packs/ud-iq3_xxs/tokenizer",
+  "model_name": "qwen3.8-flash-next-unsloth-ud-iq3_xxs",
+  "log": "/home/suffie/strata/strata-ud-iq3.log",
+  "lib_dirs": [
+    "/usr/local/cuda/bin",
+    "/usr/local/cuda/lib64"
+  ],
+  "port": 8890,
+  "gpu": 0,
+  "gpus_asked": true,
+  "host": "0.0.0.0",
+  "drafting": "dflash2",
+  "user_args": [],
+  "api_monitor": true,
+  "mmproj": "/home/suffie/Strata-data/models/qwen38-flashnext-unsloth/mmproj-BF16.gguf",
+  "vision": {
+    "exe": "/home/suffie/strata/engine/strata-vision",
+    "mmproj": "/home/suffie/Strata-data/models/qwen38-flashnext-unsloth/mmproj-BF16.gguf",
+    "model": "/home/suffie/Strata-data/models/qwen38-flashnext-unsloth/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf",
+    "gpu": true,
+    "max_tokens": 1024
+  },
+  "api_key": "REDACTED — keep out of git"
+}

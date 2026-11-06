@@ -1,0 +1,248 @@
+#!/bin/bash
+# stbench - Strata SERIEUZE benchmark (tester-stijl: context sweep, herhalingen, engine-klok)
+#   ~/bin/stbench                IQ3_S: prefill+decode over 1K..64K context (~15 min)
+#   ~/bin/stbench coder          dezelfde matrix op de Coder IQ1_M
+#   ~/bin/stbench quick          alleen 1K+8K+32K (~5 min)
+#
+# Matrix (conventie zoals externe testers: llama.cpp-bench / Unsloth / Artificial Analysis):
+#   - decode t/s bij MEERDERE input-lengtes (1K/4K/8K/16K/32K): 128 tokens output, temp 0
+#   - prefill t/s bij dezelfde lengtes + 64K (1 token output)
+#   - 2 herhalingen per punt (tweede prompt licht anders -> GEEN conversation-cache-hit),
+#     rapport toont beide + mediaan. Eén run = één sample-regel blijft: mediaan van 2 = voorlopig.
+#   - Decode = predicted_per_second (engine eval-time, NOOIT client-elapsed; fntest-regel).
+#   - MTP-acceptance (draft_n/draft_n_accepted) per punt — snelheid zonder acceptance is leugen.
+#   - TTFT client-kant erbij (prefill-indicator).
+#
+# fntest-stijl: RAM-guard (avail<3GB), VRAM-voorcheck alleen als wij zelf starten,
+# EXIT-trap die ALLEEN 8890 raakt (en alleen als wij de server zelf startten —
+# `strata` laten draaien en dan meten kan dus: dan laten we hem na afloop staan).
+# Audit: /tmp/ai-model-audit.log. Rapport: ~/bin/stbench-out/<ts>/report.md
+set -u
+RUNID="$(date '+%Y%m%d-%H%M%S')"
+OUT="${HOME}/bin/stbench-out/${RUNID}"
+mkdir -p "$OUT"
+REPORT="$OUT/report.md"
+AUDIT=/tmp/ai-model-audit.log
+STRATA="$HOME/strata"
+PY="$STRATA/.venv/bin/python"
+PORT=8890
+BASE="http://127.0.0.1:$PORT"
+
+ST_ACT="${1:-alle}"
+case "$ST_ACT" in
+    coder) ST_MODEL="coder"; ST_ACT="alle"; CFG="$STRATA/strata-coder-iq1_m.json" ;;
+    udq3)  ST_MODEL="udq3";  ST_ACT="alle"; CFG="$STRATA/strata-ud-iq3.json" ;;
+    abl)   ST_MODEL="abl";  ST_ACT="alle"; CFG="$STRATA/strata-abliterated-iq3_s.json" ;;
+    lite)   ST_MODEL="lite";   CFG="$STRATA/strata-iq3_s-lite.json" ;;
+    liteabl|lite-abl) ST_MODEL="liteabl"; CFG="$STRATA/strata-abliterated-iq3_s-lite.json" ;;
+    quick) ST_MODEL="udq3";  CFG="$STRATA/strata-ud-iq3.json" ;;
+    *)     ST_MODEL="udq3";  CFG="$STRATA/strata-ud-iq3.json" ;;
+esac
+KEY="$(jq -r '.api_key // empty' "$CFG" 2>/dev/null)"
+[ -n "$KEY" ] || { echo "geen api_key in de config — vul $CFG aan (zie configs/*.example.json)"; exit 2; }
+
+say() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$OUT/console.log"; }
+say "stbench $ST_MODEL/$ST_ACT — output: $OUT"
+{ echo "# stbench $RUNID — Strata $ST_MODEL (engine-klok, temp 0, 2x herhaald)"; echo; } > "$REPORT"
+
+# ── preflight ──────────────────────────────────────────────────────────────
+if [ ! -x "$STRATA/engine/strata" ] || [ ! -f "$CFG" ] || [ ! -x "$PY" ]; then
+    say "❌ Strata-installatie onvolledig"; exit 1
+fi
+OWNED=0
+if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+    if curl -s --max-time 3 "$BASE/health" >/dev/null 2>&1; then
+        say "Poort $PORT is al Strata — meten op de DRAAIEnde server (na afloop blijft hij staan)."
+    else
+        say "❌ $PORT bezet door iets anders dan Strata — stop dat eerst."; exit 1
+    fi
+else
+    VRAM_NOW=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -1)
+    if [ -n "$VRAM_NOW" ] && [ "$VRAM_NOW" -gt 2500 ]; then
+        say "❌ GPU ${VRAM_NOW}MiB bezet en 8890 leeg — Strata needs de volledige GPU. Stop eerst: stop"
+        exit 1
+    fi
+    OWNED=1
+fi
+
+RESTORED=0
+_stbench_cleanup() {
+    [ "$RESTORED" -eq 1 ] && return 0
+    RESTORED=1
+    if [ "$OWNED" -eq 1 ]; then
+        pkill -TERM -f "serve/server.py --engine strata" 2>/dev/null; sleep 3
+        pkill -KILL -f "serve/server.py --engine strata" 2>/dev/null
+        pkill -KILL -f "$STRATA/engine/strata " 2>/dev/null
+        fuser -k "$PORT/tcp" 2>/dev/null || true
+        say "Strata gestopt (8890 vrij; 8080/ni niet aangetast)."
+    else
+        say "Server was niet van mij (door jou gestart) — blijft staan."
+    fi
+}
+trap '_stbench_cleanup' EXIT
+trap 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] stbench gestopt (Ctrl+C)" >> $AUDIT; exit 130' INT TERM
+
+free_mb() { free -m | awk '/^Mem:/{print $7}'; }
+ram_guard() {
+    local waited=0 low=0
+    while :; do
+        local F=$(free_mb)
+        if [ "$F" -lt 3000 ]; then
+            low=$((low+5))
+            # een vorige 50GB-engine laat zijn RAM pas na 3-6 min los: eerste 240s nooit aborten,
+            # daarna pas als het 60s achtereen onder de vloer blijft
+            if [ "$waited" -ge 240 ] && [ "$low" -ge 60 ]; then
+                say "RAM-GUARD: ${F}MB available < 3GB (60s achtereen) -> meting afgebroken"
+                echo "[$(date '+%H:%M:%S')] stbench RAM-GUARD activering (${F}MB)" >> "$AUDIT"
+                touch "$OUT/ABORT"
+                return 1
+            fi
+        else
+            low=0
+        fi
+        waited=$((waited+5))
+        sleep 5
+    done
+}
+
+start_server() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] START stbench ($ST_MODEL :$PORT)" >> "$AUDIT"
+    local WAITN=240
+    say "Strata server starten (~$((WAITN*2/60)) min max)..."
+    setsid nice -n 10 "$PY" "$STRATA/serve/server.py" --engine strata --config "$CFG" --port "$PORT" \
+        > "$OUT/serve.log" 2>&1 < /dev/null &
+    local SRVPID=$!
+    local READY=0
+    for i in $(seq 1 $WAITN); do
+        if curl -s --max-time 3 "$BASE/health" >/dev/null 2>&1; then READY=1; break; fi
+        kill -0 $SRVPID 2>/dev/null || break
+        sleep 2
+    done
+    [ "$READY" -eq 1 ] || { say "❌ Server niet ready binnen $((WAITN*2/60)) min"; tail -15 "$OUT/serve.log"; exit 1; }
+    say "Server ready."
+}
+[ "$OWNED" -eq 1 ] && start_server
+ram_guard & GPID=$!
+
+# ── prompts: vaste lengtes, per herhaling net anders (anti conversation-cache) ──
+mkprompt() {  # $1=target tokens  $2=salt
+    python3 - "$1" "$2" <<'PY'
+import sys
+tgt=int(sys.argv[1]); salt=sys.argv[2]
+topics=["cache eviction","TTL expiry","sharding","consistency","write-back","partitioning","backpressure","observability","failover","quorum"]
+unit=("Section {i} on {t}: a node coordinates with {a} peers using exponential backoff over a {b} ms window, "
+"retrying {c} times before the coordinator publishes a {t} report; peers verify state against a quorum of {d} "
+"members, and each transition emits an audit record with node id, sequence, and checksum. ")
+out=[]; i=0; chars=0
+# ~4 chars/tok voor deze Engelse tekst: doel = tgt*4 tekens (niet units*4!)
+while chars < tgt*4*0.98:
+    t=topics[i%len(topics)]
+    s=unit.format(i=i,t=t,a=3+(i*7)%9,b=50+(i*13)%400,c=2+(i*3)%6,d=3+(i*5)%7)
+    out.append(s); chars+=len(s)+2
+    i+=1
+# salt-anker halverwege (needle + cache-buster)
+out[len(out)//2]=out[len(out)//2].replace("audit record","audit record (anchor "+salt+")")
+print("\n\n".join(out))
+PY
+}
+
+# ── één meetpunt ───────────────────────────────────────────────────────────
+# $1=tag $2=tokens-input $3=max_tokens-output $4=salt
+point() {
+    local TAG="$1" TOK="$2" MAXT="$3" SALT="$4"
+    local P; P="$(mkprompt "$TOK" "$SALT")"
+    local T0 T1 TTFT=""
+    T0=$(python3 -c 'import time; print(int(time.time()*1000))')
+    # FIX 02-10: payload als commando-argument gaf "Argument list too long" bij 64K
+    # (ARG_MAX). Nooit via de cmdline, altijd via bestand.
+    local PAY="$OUT/$TAG-payload.json"
+    python3 -c '
+import json,sys
+print(json.dumps({"model":"strata","stream":True,"max_tokens":int(sys.argv[1]),"temperature":0,
+ "reasoning_effort":"none","messages":[{"role":"user","content":sys.stdin.read()}]}))
+' "$MAXT" <<< "$P" > "$PAY"
+    while IFS= read -r line; do
+        case "$line" in
+            data:*)
+                [ "$line" = "data: [DONE]" ] && break
+                if [ -z "$TTFT" ]; then TTFT=$(( $(python3 -c 'import time; print(int(time.time()*1000))') - T0 )); fi ;;
+        esac
+    done < <(curl -sN "$BASE/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+        -H 'Content-Type: application/json' --data-binary "@$PAY")
+    [ -f "$OUT/ABORT" ] && { say "afgebroken (RAM-GUARD)"; exit 1; }
+    T1=$(python3 -c 'import time; print(int(time.time()*1000))')
+    # FAALDE-detector: geen enkele data-chunk = request is afgewezen; dan zijn de
+    # last_timings stale (van het vorige punt) — NOOIT rapporteren als meetpunt.
+    if [ -z "$TTFT" ]; then
+        say "  $TAG: FAALDE — geen response (payload $(wc -c < "$PAY") bytes)"
+        echo "- **$TAG**: FAALDE (geen response)" >> "$REPORT"
+        return 1
+    fi
+    sleep 1
+    local STATUS; STATUS=$(curl -s --max-time 10 "$BASE/v1/status" -H "Authorization: Bearer $KEY" 2>/dev/null)
+    local PRE GENPS PN GN DRAFTS DACC CTOK
+    PRE=$(jq -r '.last_timings.prompt_per_second // empty' <<< "$STATUS")
+    GENPS=$(jq -r '.last_timings.predicted_per_second // empty' <<< "$STATUS")
+    PN=$(jq -r '.last_timings.prompt_n // empty' <<< "$STATUS")
+    GN=$(jq -r '.last_timings.predicted_n // empty' <<< "$STATUS")
+    DRAFTS=$(jq -r '.last_timings.draft_n // empty' <<< "$STATUS")
+    DACC=$(jq -r '.last_timings.draft_n_accepted // empty' <<< "$STATUS")
+    CTOK=$(jq -r '.last_timings.cache_n // empty' <<< "$STATUS")
+    local CLIENT=$(( (T1-T0)/1000 ))
+    # engine clamped predicted_per_second op 10000 bij 1-token output (prefill-probe): zinloos
+    [ "${GENPS%.*}" -ge 9999 ] 2>/dev/null && GENPS="n/a"
+    say "  $TAG: prefill ${PRE:-?} t/s | decode ${GENPS:-?} t/s | in ${PN:-?} tok (cache ${CTOK:-0}) | TTFT ${TTFT:-?}ms | client ${CLIENT}s | MTP ${DACC:-?}/${DRAFTS:-?}"
+    echo "- **$TAG**: prefill ${PRE:-?} · decode ${GENPS:-?} · in ${PN:-?} · TTFT ${TTFT:-?}ms · MTP ${DACC:-?}/${DRAFTS:-?}" >> "$REPORT"
+    echo "$TAG|$PRE|$GENPS" >> "$OUT/points"
+}
+
+# warm-up (nooit meten — fntest-regel)
+say "warm-up (300 tok, niet gemeten)..."
+curl -s --max-time 600 "$BASE/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"strata\",\"max_tokens\":300,\"temperature\":0,\"reasoning_effort\":\"none\",\"messages\":[{\"role\":\"user\",\"content\":\"Schrijf een korte Python functie die een PRIME getal test, met docstring en 3 unit tests.\"}]}" > "$OUT/warmup.json" 2>&1
+
+# context-matrix: quick = 1K+8K+32K, anders volledige sweep tot 262K
+if [ "$ST_ACT" = "quick" ]; then LENS="1024 8192 32768"; else LENS="1024 4096 8192 32768 131072 262144"; fi
+
+
+echo "## Decode (128 tok output, temp 0) — per lengte 2x" >> "$REPORT"; echo >> "$REPORT"
+for L in $LENS; do
+    point "decode-${L}#1" "$L" 128 "A$RUNID"
+    point "decode-${L}#2" "$L" 128 "B$RUNID"
+done
+
+echo "## Prefill (1 tok output) — per lengte + 64K" >> "$REPORT"; echo >> "$REPORT"
+for L in $LENS; do
+    point "prefill-${L}" "$L" 1 ""
+done
+point "prefill-65536" 65536 1 ""
+
+# mediaan-tabel
+{ echo; echo "## Mediaan (van 2 runs)"; echo '```';
+  for L in $LENS; do
+    python3 - "$L" "$OUT/points" <<'PY'
+import sys
+L=sys.argv[1]; rows=[l.strip().split("|") for l in open(sys.argv[2])]
+d=[float(r[2]) for r in rows if r[0].startswith(f"decode-{L}#") and r[2]]
+p=[float(r[1]) for r in rows if r[0].startswith(f"prefill-{L}") and r[1]]
+m=lambda v: sorted(v)[len(v)//2] if v else 0
+print(f"{int(L):>6} tok in | decode mediaan {m(d):6.1f} t/s | prefill {max(p):7.1f} t/s")
+PY
+  done
+  echo '```'; } >> "$REPORT"
+
+# bij lite-varanten: expert-cache-hitrate is de waarheid achter de t/s
+if [ "$ST_MODEL" = "lite" ] || [ "$ST_MODEL" = "liteabl" ]; then
+  { echo; echo "## Expert-cache hit (laatste 8 runs uit server-log)"; echo '```'
+    LOGF="$OUT/serve.log"; [ -s "$LOGF" ] || LOGF="$HOME/strata/serve-run.log"
+    grep -aoE 'expert cache [0-9.]+% hit' "$LOGF" 2>/dev/null | tail -8
+    grep -aoE 'filling the GPU.s expert cache \([0-9]+ experts, [0-9.]+ GiB of VRAM\)' "$OUT/serve.log" 2>/dev/null | head -1
+    echo '```'; } >> "$REPORT"
+fi
+
+kill $GPID 2>/dev/null
+echo >> "$REPORT"; date >> "$REPORT"
+_stbench_cleanup
+say "✅ Klaar. Rapport: $REPORT"
+echo ""; echo "════════════════════════"; cat "$REPORT"
