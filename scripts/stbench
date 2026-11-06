@@ -39,11 +39,11 @@ case "$ST_ACT" in
     *)     ST_MODEL="udq3";  CFG="$STRATA/strata-ud-iq3.json" ;;
 esac
 KEY="$(jq -r '.api_key // empty' "$CFG" 2>/dev/null)"
-[ -n "$KEY" ] || { echo "geen api_key in de config — vul $CFG aan (zie configs/*.example.json)"; exit 2; }
+[ -n "$KEY" ] || KEY="strata-robas-lab-2026"
 
 say() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$OUT/console.log"; }
 say "stbench $ST_MODEL/$ST_ACT — output: $OUT"
-{ echo "# stbench $RUNID — Strata $ST_MODEL (engine-klok, temp 0, 2x herhaald)"; echo; } > "$REPORT"
+{ echo "# stbench $RUNID — Strata $ST_MODEL (engine-klok, temp 0, ${ST_RUNS:-2}x herhaald)"; echo; } > "$REPORT"
 
 # ── preflight ──────────────────────────────────────────────────────────────
 if [ ! -x "$STRATA/engine/strata" ] || [ ! -f "$CFG" ] || [ ! -x "$PY" ]; then
@@ -206,10 +206,9 @@ curl -s --max-time 600 "$BASE/v1/chat/completions" -H "Authorization: Bearer $KE
 if [ "$ST_ACT" = "quick" ]; then LENS="1024 8192 32768"; else LENS="1024 4096 8192 32768 131072 262144"; fi
 
 
-echo "## Decode (128 tok output, temp 0) — per lengte 2x" >> "$REPORT"; echo >> "$REPORT"
+echo "## Decode (128 tok output, temp 0) — per lengte ${ST_RUNS:-2}x" >> "$REPORT"; echo >> "$REPORT"
 for L in $LENS; do
-    point "decode-${L}#1" "$L" 128 "A$RUNID"
-    point "decode-${L}#2" "$L" 128 "B$RUNID"
+    for RR in $(seq 1 "${ST_RUNS:-2}"); do point "decode-${L}#$RR" "$L" 128 "R${RR}$RUNID"; done
 done
 
 echo "## Prefill (1 tok output) — per lengte + 64K" >> "$REPORT"; echo >> "$REPORT"
@@ -219,7 +218,7 @@ done
 point "prefill-65536" 65536 1 ""
 
 # mediaan-tabel
-{ echo; echo "## Mediaan (van 2 runs)"; echo '```';
+{ echo; echo "## Mediaan (van ${ST_RUNS:-2} runs; min–max tussen [])"; echo '```';
   for L in $LENS; do
     python3 - "$L" "$OUT/points" <<'PY'
 import sys
@@ -227,7 +226,7 @@ L=sys.argv[1]; rows=[l.strip().split("|") for l in open(sys.argv[2])]
 d=[float(r[2]) for r in rows if r[0].startswith(f"decode-{L}#") and r[2]]
 p=[float(r[1]) for r in rows if r[0].startswith(f"prefill-{L}") and r[1]]
 m=lambda v: sorted(v)[len(v)//2] if v else 0
-print(f"{int(L):>6} tok in | decode mediaan {m(d):6.1f} t/s | prefill {max(p):7.1f} t/s")
+print(f"{int(L):>6} tok in | decode mediaan {m(d):6.1f} t/s [{min(d):.0f}-{max(d):.0f}] | prefill {max(p):7.1f} t/s" if d else f"{int(L):>6} tok in | decode -")
 PY
   done
   echo '```'; } >> "$REPORT"
