@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next 177B MoE — daily driver on one RTX 5090
 
-**TL;DR** — A 177B-parameter MoE language model (125B MoE backbone + 51B PLE n-gram tables) runs as a *daily assistant* on one RTX 5090 (32 GB VRAM) with 63 GB system RAM: **262K context, ~260 t/s decode at long context, vision included**, plus music/image/TTS pipelines co-resident on the same GPU. The winning quant is Unsloth Dynamic **UD-IQ3_XXS + DFlash2 drafting**; the exact failure boundary of 63 GB RAM is measured, not guessed. What you need: RTX 50-series (sm_120), ≥64 GB RAM, ≥100 GB fast NVMe, Strata ≥0.2.11 with engine ≥0.1.57.
+**TL;DR** — A 177B-parameter MoE language model (125B MoE backbone + 51B PLE n-gram tables) runs as a *daily assistant* on one RTX 5090 (32 GB VRAM) with 63 GB system RAM: **262K context, ~260 t/s decode at long context, vision included**, plus music/image/TTS pipelines co-resident on the same GPU. The winning quant is Unsloth Dynamic **UD-IQ3_XXS + DFlash2 drafting**; the exact failure boundary of 63 GB RAM is measured, not guessed. What you need: RTX 50-series (sm_120), ≥64 GB RAM, ≥100 GB fast NVMe, Strata 0.2.16 / engine 0.1.62 (tested; minimum ≥0.2.11 / 0.1.57).
 
 *Speeds are my own measurements on this exact box; recipes are reproducible down to checksums — including what failed.*
 
@@ -18,7 +18,7 @@
 
 ## Quickstart (5 steps)
 
-1. Install [Strata](https://github.com/Niko1221/Strata) ≥ v0.2.11 and download the CUDA-13 engine package 0.1.57.
+1. Install [Strata](https://github.com/Niko1221/Strata) ≥ v0.2.16 and download the CUDA-13 engine package 0.1.62 (the recipe also holds on ≥0.2.11 / 0.1.57).
 2. Download `unsloth/Qwen3.8-Flash-Next-GGUF` → quant **UD-IQ3_XXS** (pinned revision `d96201194f103c906994f283f504209dc8d2a10c`; ~84 GB of files on disk) plus `mmproj-BF16.gguf` for vision.
 3. Build the DFlash2 drafter pack: clone `incoai/Qwen3.8-Flash-Next-DFlash2` (revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6`), run Strata's `tools/dflash2_pack.py --q4_0` on `model.safetensors` → expect pack SHA-256 `cda40d62d0eb8f37ed6e272142641a1d2f0de4a32f9e14d0416e7a71534849f1` (Strata's own pinned hash, bit-for-bit). Optionally build the smaller `-selq4` variant too (`--q4_0 --q4_0-selector`, SHA-256 `4a42b98220ea7880664002c8edda1563aecbae754b762a2e2f31b2b91ee93ecd`); the engine auto-prefers it. Gotcha: Strata's drafting module only activates DFlash2 when the **plain** `q4_0.pack` exists on disk — keep both files.
 4. Start with `configs/strata-ud-iq3.example.json` (fill in your own API key). Key engine flags: `--max-context 262144 --kv int8 --kv-resident 32768 --mmap-experts --expert-cache auto --prefill auto --draft dflash2 --draft-model /path/to/dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack --draft-fallback none --spec 6`, env `STRATA_HC_Q8=1`, `STRATA_ROUTE_TAIL_SKIP=0`.
@@ -45,6 +45,20 @@ Prefill plateau on engine 0.1.57: ~5500 t/s (engine 0.1.49.x plateaued at ~3100 
 **Verdict:** UD-IQ3_XXS wins exactly where long context matters (+28% at 262K, +19% at 131K) and is ~15–30% slower for short chat — so IQ3_S stays on the box as the "sprinter" mode.
 
 **Quality:** KL to Q8_0 from Strata's published quant studies (these KL figures are Niko's, *not measured on this box*): IQ3_S 0.144 → UD-IQ4_XS 0.101, **lower = more faithful**. KL of UD-IQ3_XXS itself I did not measure; by quant size it sits between the two. The speed table above is my own measurement.
+
+## Standard protocol benchmark (2026-11-20, engine 0.1.62, thinking ON)
+
+The table above is a temperature-0 speed suite (thinking off). I also ran Strata's **standard benchmark protocol** (`strata bench run`, draft `strata-qwen38-thinking-v1-draft.1`) on Strata 0.2.16 / engine 0.1.62: frozen prompts, thinking on at `reasoning_effort xhigh`, the Qwen model-card sampling (temp 1.0, top_p 0.95, top_k 20), 21 measured requests + 12 sanity checks, freshly loaded engine, loopback. Status **complete**, conforming (commit `58ee3227720629ff2e41d640165ebe89c880dfef`).
+
+| Case | Prompt t/s | Decode t/s | TTFT s | Capped |
+|---|---|---|---|---|
+| short | n/a | 123.1 (42.8–134.1) | 0.79 | 0/3 |
+| prompt-4k | 1331.6 (406.5–1455.4) | 138.4 (116.5–167.1) | 3.09 | 3/3 |
+| prompt-16k | 3663.1 (2649.3–4263.9) | 155.5 (155.4–161.9) | 4.49 | 3/3 |
+
+Median (min–max), n=3. **Sanity 11/12** — instruction 4/4, retrieval 4/4, tool-calls 3/4 (T2 `get_weather` returned prose instead of a structured call). Decode is lower than the temp-0 table because reasoning tokens count toward the 512-token cap and xhigh thinking is on; all 4K/16K runs reached the cap while still reasoning (expected per protocol). The cold→warm expert cache is visible: 4K prompt r1 406 → r3 1455 t/s. Suite time after model load: 1 min 45 s.
+
+Full evidence (per-request JSON, raw usage/timings, outputs, chat template, corpus manifest): [`results/standard-2026-11-20-rtx5090/`](results/standard-2026-11-20-rtx5090/). Draft-protocol result — not an approved-manifest entry.
 
 ## The failure boundary — quantified
 
