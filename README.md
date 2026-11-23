@@ -79,6 +79,23 @@ I also ran the community suite (`tools/strata_bench.py --long`, thinking off, te
 
 Full evidence (auto-generated suite README + results.json + provenance + raw stbench samples): [`results/community-2026-11-23-rtx5090-0.1.66/`](results/community-2026-11-23-rtx5090-0.1.66/).
 
+## Inkling-2-Mini through the Strata engine (2026-11-23, incl. a farm sweep)
+
+Inkling-2-Mini SQ-20 also runs on the Strata `inkling2` engine (same day as the 0.1.66 A/B above; all experts VRAM-pinned, KV fp8, 262K, vision). Community suite (thinking off): chat decode 161 (144-244), fresh prompts 4K 8713 / 16K 7860 / 32K 6742 tok/s, agent decode 142. Two honest findings: the DSpark drafter GGUF is accepted (`--dspark`, no skip line) but is a no-op on the `.strata` native build (161 vs 155 without - noise), and this engine has no conversation cache (0% reuse, 37k re-read tokens per agent session), which is why ingine (408/754, DSpark working, cache on) stays the faster Inkling stack on this box.
+
+What the Strata engine does give me is the farm, measured in one sweep (32K context, `--parallel` 4/8/16/32, one suite per step, N clients in parallel):
+
+| clients | aggregate decode t/s | per stream t/s | p50 latency |
+|---|---|---|---|
+| 4  | 276  | 69 | 1.8 s |
+| 8  | 367  | 46 | 2.8 s |
+| 16 | 495  | 31 | 4.0 s |
+| 32 | 606  | 19 | 6.5 s |
+
+Scaling is sublinear but real: 8x the clients still yields +120% aggregate over 4, at latencies agents tolerate. (External RTX 5090 reference: 4090 t/s aggregate at 64 clients - ingine/DSpark territory; a single card, single-engine farm like this one is in a different weight class, and now has a published curve.)
+
+Full evidence (auto suite README/results.json + four per-variant results.json + provenance incl. the DSpark no-op): [`results/community-2026-11-23-rtx5090-inkling-2-mini-strata/`](results/community-2026-11-23-rtx5090-inkling-2-mini-strata/).
+
 ## The failure boundary — quantified
 
 **UD-IQ4_XS (94 GB of files) does not fit this machine: unusable.** Its expert streams exceed what 63 GB RAM can hold as page cache, so fresh conversations keep re-reading NVMe: 35–81 t/s at short/medium context, 5 t/s on first contact after load. The long-context rows (160 @32K, 211 @262K) look survivable only because the benchmark replays the *same* prompt — a permanently hot expert set; real multi-topic chat does not get that free ride. This quant belongs on ≥96 GB RAM machines.
