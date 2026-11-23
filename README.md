@@ -60,6 +60,25 @@ Median (min–max), n=3. **Sanity 11/12** — instruction 4/4, retrieval 4/4, to
 
 Full evidence (per-request JSON, raw usage/timings, outputs, chat template, corpus manifest): [`results/standard-2026-11-20-rtx5090/`](results/standard-2026-11-20-rtx5090/). Draft-protocol result — not an approved-manifest entry.
 
+## Engine update 0.1.62 → 0.1.66 (2026-11-23, engine 0.1.66, workaround active)
+
+0.1.66 crashes at startup on this RTX 5090 (sm_120) when `STRATA_HC_Q8` is on, which is the default for UD packs: the window warm-up dies with `verify: layer 0 never rang` (upstream issues #6712 / #6704 / #6767; fix PR #6714 still open). The documented workaround, `STRATA_HC_Q8=0`, gets 0.1.66 running — but it also disables the Q8 TensorCore fused kernels, so **every delta below is "0.1.66 with the workaround"**, not 0.1.66's best case. Same box, same flags, same stbench script as the 2026-11-06 table; decode figures are the steady second sample of each point (the first sample after an idle gap rides the GPU clock ramp, and is shown nowhere else here).
+
+| context | decode 0.1.62 | decode 0.1.66 (HC_Q8=0) | prefill 0.1.62 | prefill 0.1.66 (range over today's fresh-prompt samples) |
+|---|---|---|---|---|
+| 1K   | 189 | ~205 (warm samples; post-idle pair was 45/52) | 348 | 290 |
+| 4K   | 198 | **285** (+44%) | 1506 | 630–975, suite 824 (−35 to −58%) |
+| 8K   | 189 | **342** (+81%) | 2795 | 1779–1811 (−35%) |
+| 32K  | 251 | **311** (+24%) | 5320 | 2066–2653 (−50 to −61%) |
+| 131K | 277 | 236 (−15%) | 5565 | 3553–5907 (−36 to +6%) |
+| 262K | 261 | 245 (−6%) | 5548 | 4559–6149 (−18 to +11%) |
+
+The shape is clear: mid-length decode got much faster (+24 to +81%), decode at very long context is slightly down — and prefill below 32K dropped 35–61%, while ≥131K is roughly unchanged to up. The prefill dip is plausibly exactly the fused-Q8 kernel path the workaround turns off (0.1.62 ran with HC_Q8 on). If PR #6714 lands, those prefill numbers are the prize.
+
+I also ran the community suite (`tools/strata_bench.py --long`, thinking off, temp 0, 3 runs): chat decode median 78.3 (33.6–153.4, still warming during run 1), agent-session decode 195 (43.6–246.3), conversation-cache hit 70.6% with 5 re-read tokens per session, fresh 4K/16K/32K prompts 824 / 2684 / 2066 t/s. No 0.1.62 suite run on this box for direct comparison (the 2026-11-20 entry uses the different, thinking-on standard protocol).
+
+Full evidence (auto-generated suite README + results.json + provenance + raw stbench samples): [`results/community-2026-11-23-rtx5090-0.1.66/`](results/community-2026-11-23-rtx5090-0.1.66/).
+
 ## The failure boundary — quantified
 
 **UD-IQ4_XS (94 GB of files) does not fit this machine: unusable.** Its expert streams exceed what 63 GB RAM can hold as page cache, so fresh conversations keep re-reading NVMe: 35–81 t/s at short/medium context, 5 t/s on first contact after load. The long-context rows (160 @32K, 211 @262K) look survivable only because the benchmark replays the *same* prompt — a permanently hot expert set; real multi-topic chat does not get that free ride. This quant belongs on ≥96 GB RAM machines.
